@@ -1,0 +1,179 @@
+//@version=8
+
+indicator("Money Volume • Buyers vs Sellers v3", shorttitle="MoneyVol v3", overlay=false, max_labels_count=500, max_bars_back=100)
+
+// ===== Inputs =====
+grpData = "Data"
+method = input.string("Intrabar (best)", "Split method", options=["Intrabar (best)", "Close position (estimate)", "Up/Down candle"], group=grpData, tooltip="Intrabar: splits each candle into 1-minute bars and classifies each one. Close position: guesses from where the candle closed in its range. Up/Down: whole candle is buy if green, sell if red.")
+units  = input.string("BTC", "Display units", options=["BTC", "USD"], group=grpData)
+
+grpWin = "Contract window"
+view      = input.string("Buy/Sell bars", "View", options=["Buy/Sell bars", "Running total"], group=grpWin, tooltip="Add the indicator twice to see both at once.")
+windowLen = input.string("1 Hour", "Window length", options=["15 Min", "1 Hour", "1 Day"], group=grpWin, tooltip="Match this to the Kalshi contract you're looking at.")
+dayHourET = input.int(17, "Daily reset hour (Eastern)", minval=0, maxval=23, group=grpWin, tooltip="Only used for the 1 Day window. Set it to the contract's close time in ET.")
+
+grpPanel = "Panels"
+showGrid    = input.bool(true, "Show recent-bars panel", group=grpPanel)
+gridBars    = input.int(8, "Bars in panel", minval=3, maxval=20, group=grpPanel)
+gridPosIn   = input.string("Bottom right", "Recent-bars panel position", options=["Bottom right", "Bottom left", "Bottom center", "Top left"], group=grpPanel)
+showSummary = input.bool(true, "Show summary panel (top right)", group=grpPanel)
+txtSizeIn   = input.string("Small", "Panel text size", options=["Tiny", "Small", "Normal"], group=grpPanel)
+showBarNums = input.bool(false, "Also show net number above each bar", group=grpPanel)
+
+grpLook = "Chart"
+showMA     = input.bool(true, "Show average line", group=grpLook)
+maLen      = input.int(20, "Average length", minval=1, group=grpLook)
+showSpikes = input.bool(true, "Highlight volume spikes", group=grpLook)
+spikeMult  = input.float(2.0, "Spike = volume above (× average)", minval=1.0, step=0.25, group=grpLook)
+buyColor   = input.color(color.teal, "Buyers color", group=grpLook)
+sellColor  = input.color(color.orange, "Sellers color", group=grpLook)
+
+isUsd    = units == "USD"
+barsView = view == "Buy/Sell bars"
+tsz      = txtSizeIn == "Tiny" ? size.tiny : txtSizeIn == "Small" ? size.small : size.normal
+gridPos  = gridPosIn == "Bottom right" ? position.bottom_right : gridPosIn == "Bottom left" ? position.bottom_left : gridPosIn == "Bottom center" ? position.bottom_center : position.top_left
+
+// ===== Number formatting (compact: 12.3K, 4.5M) =====
+fmt(float x) =>
+    float a = math.abs(x)
+    string s = ""
+    if a >= 1e9
+        s := str.tostring(x / 1e9, "0.#") + "B"
+    else if a >= 1e6
+        s := str.tostring(x / 1e6, "0.#") + "M"
+    else if a >= 1e3
+        s := str.tostring(x / 1e3, "0.#") + "K"
+    else if a >= 10
+        s := str.tostring(x, "0")
+    else
+        s := str.tostring(x, "0.##")
+    s
+
+// Value in the chosen units, no sign
+fmtV(float x) =>
+    isUsd ? "$" + fmt(math.abs(x)) : fmt(math.abs(x))
+
+// Value with + / - sign
+fmtS(float x) =>
+    string sign = x > 0 ? "+" : x < 0 ? "-" : ""
+    sign + (isUsd ? "$" : "") + fmt(math.abs(x))
+
+// ===== Buy / sell split =====
+tfSec  = timeframe.in_seconds()
+ltf    = tfSec <= 60 ? timeframe.period : tfSec <= 3600 ? "1" : tfSec <= 14400 ? "5" : tfSec <= 86400 ? "15" : "60"
+useLtf = method == "Intrabar (best)" and tfSec > 60
+
+[ao, ac, av] = request.security_lower_tf(syminfo.tickerid, ltf, [open, close, volume])
+
+float buyC  = 0.0
+float sellC = 0.0
+float buyU  = 0.0
+float sellU = 0.0
+bool intraUsed = false
+int n = array.size(av)
+
+if useLtf and n > 0
+    intraUsed := true
+    for i = 0 to n - 1
+        float vi = nz(array.get(av, i))
+        float ci = array.get(ac, i)
+        float oi = array.get(ao, i)
+        if not na(ci) and not na(oi)
+            float wb = ci > oi ? 1.0 : ci < oi ? 0.0 : 0.5
+            buyC  += vi * wb
+            sellC += vi * (1.0 - wb)
+            buyU  += vi * wb * ci
+            sellU += vi * (1.0 - wb) * ci
+else
+    float rng = high - low
+    float w = method == "Up/Down candle" ? (close >= open ? 1.0 : 0.0) : (rng > 0 ? (close - low) / rng : 0.5)
+    w := math.max(0.0, math.min(1.0, w))
+    float v = nz(volume)
+    buyC  := v * w
+    sellC := v * (1.0 - w)
+    buyU  := buyC * close
+    sellU := sellC * close
+
+buyVal  = isUsd ? buyU : buyC
+sellVal = isUsd ? sellU : sellC
+netVal  = buyVal - sellVal
+totVal  = buyVal + sellVal
+
+// ===== Running total for the contract window =====
+int etHour = hour(time, "America/New_York")
+int winMs  = windowLen == "15 Min" ? 15 * 60000 : 60 * 60000
+bool newIntraday = math.floor(time / winMs) != math.floor(nz(time[1]) / winMs)
+bool newDay      = etHour == dayHourET and nz(etHour[1], -1) != dayHourET
+bool newWindow   = windowLen == "1 Day" ? newDay : newIntraday
+
+var float winBuy  = 0.0
+var float winSell = 0.0
+if newWindow
+    winBuy  := 0.0
+    winSell := 0.0
+winBuy  += buyVal
+winSell += sellVal
+winNet = winBuy - winSell
+
+// ===== Volume spikes =====
+avgTot  = ta.sma(totVal, maLen)
+spikeX  = avgTot > 0 ? totVal / avgTot : 0.0
+isSpike = spikeX >= spikeMult
+
+// ===== Plots =====
+hline(0, "Zero", color=color.new(color.gray, 70))
+plot(barsView ? buyVal : na,  title="Buyers",  style=plot.style_columns, color=buyColor)
+plot(barsView ? -sellVal : na, title="Sellers", style=plot.style_columns, color=sellColor)
+plot(barsView and showMA ? avgTot : na, title="Average volume", color=color.blue, linewidth=2)
+plot(barsView ? na : winNet, title="Running total", style=plot.style_columns, color=winNet >= 0 ? buyColor : sellColor)
+
+bgcolor(showSpikes and isSpike ? color.new(color.yellow, 82) : na, title="Volume spike")
+bgcolor(newWindow ? color.new(color.gray, 88) : na, title="New window")
+
+// ===== Optional: one small net number above each recent bar =====
+var array<label> lbls = array.new<label>()
+if showBarNums and barsView and bar_index > last_bar_index - gridBars
+    label lb = label.new(bar_index, buyVal, fmtS(netVal), style=label.style_label_down, color=color.new(color.white, 100), textcolor=netVal >= 0 ? buyColor : sellColor, size=size.tiny)
+    array.push(lbls, lb)
+    while array.size(lbls) > gridBars
+        label.delete(array.shift(lbls))
+
+// ===== Recent-bars panel (oldest on the left, newest on the right) =====
+var table grid = table.new(gridPos, 21, 4, bgcolor=color.new(color.black, 25), border_color=color.new(color.gray, 70), border_width=1)
+if showGrid and barstate.islast
+    string tfmt = tfSec >= 86400 ? "MM/dd" : "HH:mm"
+    table.cell(grid, 0, 0, "ET",   text_color=color.gray, text_size=tsz)
+    table.cell(grid, 0, 1, "Buy",  text_color=buyColor,   text_size=tsz)
+    table.cell(grid, 0, 2, "Sell", text_color=sellColor,  text_size=tsz)
+    table.cell(grid, 0, 3, "Net",  text_color=color.white, text_size=tsz)
+    for k = 0 to gridBars - 1
+        int idx = gridBars - 1 - k
+        int col = k + 1
+        float b = buyVal[idx]
+        float s = sellVal[idx]
+        float nt = b - s
+        bool sp = isSpike[idx]
+        table.cell(grid, col, 0, str.format_time(time[idx], tfmt, "America/New_York"), text_color=sp ? color.yellow : color.gray, text_size=tsz)
+        table.cell(grid, col, 1, fmtV(b),  text_color=buyColor,  text_size=tsz)
+        table.cell(grid, col, 2, fmtV(s),  text_color=sellColor, text_size=tsz)
+        table.cell(grid, col, 3, fmtS(nt), text_color=nt >= 0 ? buyColor : sellColor, text_size=tsz)
+
+// ===== Summary panel =====
+var table summ = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 25), border_color=color.new(color.gray, 70), border_width=1)
+if showSummary and barstate.islast
+    float winTot = winBuy + winSell
+    float winBuyPct = winTot > 0 ? winBuy / winTot * 100 : 50.0
+    table.cell(summ, 0, 0, "This bar", text_color=color.gray, text_size=tsz)
+    table.cell(summ, 1, 0, units,      text_color=color.gray, text_size=tsz)
+    table.cell(summ, 0, 1, "Buy",      text_color=buyColor,   text_size=tsz)
+    table.cell(summ, 1, 1, fmtV(buyVal),  text_color=buyColor,  text_size=tsz)
+    table.cell(summ, 0, 2, "Sell",     text_color=sellColor,  text_size=tsz)
+    table.cell(summ, 1, 2, fmtV(sellVal), text_color=sellColor, text_size=tsz)
+    table.cell(summ, 0, 3, "Net",      text_color=color.white, text_size=tsz)
+    table.cell(summ, 1, 3, fmtS(netVal), text_color=netVal >= 0 ? buyColor : sellColor, text_size=tsz)
+    table.cell(summ, 0, 4, windowLen + " net", text_color=color.white, text_size=tsz)
+    table.cell(summ, 1, 4, fmtS(winNet) + "  (" + str.tostring(winBuyPct, "0") + "% buy)", text_color=winNet >= 0 ? buyColor : sellColor, text_size=tsz)
+    table.cell(summ, 0, 5, "Vol vs avg", text_color=color.white, text_size=tsz)
+    table.cell(summ, 1, 5, str.tostring(spikeX, "0.0") + "x" + (isSpike ? "  SPIKE" : ""), text_color=isSpike ? color.yellow : color.white, text_size=tsz)
+    table.cell(summ, 0, 6, "Source", text_color=color.gray, text_size=tsz)
+    table.cell(summ, 1, 6, intraUsed ? ltf + "-min split" : "Estimate", text_color=color.gray, text_size=tsz)
