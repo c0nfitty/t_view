@@ -1,0 +1,109 @@
+I updated the script so it keeps the columns and also prints the numbers. The file is MoneyVol_Numbers.pine in the sidebar; she can copy all of it into TradingView’s Pine Editor, save, and click Add to chart. I haven’t run it in TradingView, so if it shows an error, send me the message and I’ll fix it.
+
+What changed:
+
+Same columns as before: green bars above zero for buyers, orange below for sellers, plus the blue moving-average line.
+Numbers on the bars: each of the last 15 bars gets a label above the green column and below the orange one, like “12.4 BTC” or “$1.2M”. She can change how many bars get numbers in the settings. Putting them on every bar back to 2019 would make the chart unreadable.
+BTC or USD switch: a “Display Units” setting picks coins traded or dollars. The old version only showed dollars, divided by a million.
+Bigger summary table in the top-right corner for the current bar, showing BTC and USD side by side: Buy, Sell, Delta (buy minus sell) and the buy/sell split as percentages.
+
+Before she bets on it:
+
+Use a chart that has volume. The BTC numbers assume the chart’s volume is counted in BTC. That’s true for exchange charts like COINBASE:BTCUSD or BINANCE:BTCUSDT. Some index charts have no volume at all, and the indicator will just sit there blank.
+These are estimates. TradingView doesn’t know who actually bought or sold. The script guesses from where each bar closed between its high and low. That’s a reasonable rough read on pressure, but it isn’t real order-flow data.
+It only covers one exchange. Kalshi’s Bitcoin markets settle on a price index built from several exchanges, so one exchange’s volume is just part of the picture.
+
+The indicator describes what already happened; it doesn’t predict the next move. Bitcoin, as far as I can tell, does whatever it wants and then lets charts explain it afterward.
+
+
+//@version=6
+//=============================================================================
+// Money Volume • Buyers vs Sellers (+ Numbers)
+// Based on the original by @tgambinox
+// Shows estimated buy/sell volume as columns AND as numbers on each bar,
+// in either BTC (coins traded) or USD (coins × price).
+//=============================================================================
+indicator("Money Volume • Buyers vs Sellers (+ Numbers)", shorttitle="MoneyVol#", overlay=false, max_labels_count=500)
+
+// ===== Inputs =====
+method     = input.string("Proportional", "Method", options=["Binary","Proportional"], tooltip="Binary: whole bar counts as buyers if Close >= Open. Proportional: split by where the close sits inside the bar's High-Low range.")
+units      = input.string("BTC", "Display Units", options=["BTC","USD"], tooltip="BTC = estimated coins bought/sold. USD = coins × price.")
+multiplier = input.float(1.0, "Contract Multiplier", tooltip="Leave at 1 for normal crypto pairs.")
+showLabels = input.bool(true, "Show numbers on bars")
+labelBars  = input.int(15, "Number of recent bars with numbers", minval=1, maxval=200)
+textSize   = input.string("Small", "Number size", options=["Tiny","Small","Normal"])
+showMA     = input.bool(true, "Show Moving Average")
+maLen      = input.int(20, "MA Length", minval=1)
+buyColor   = input.color(color.teal, "Buyers Color")
+sellColor  = input.color(color.orange, "Sellers Color")
+
+// ===== Number formatting (1.2K, 3.4M, 5.6B) =====
+fmt(float x) =>
+    a = math.abs(x)
+    a >= 1e9 ? str.tostring(x / 1e9, "0.##") + "B" :
+     a >= 1e6 ? str.tostring(x / 1e6, "0.##") + "M" :
+     a >= 1e3 ? str.tostring(x / 1e3, "0.##") + "K" :
+     str.tostring(x, "0.##")
+
+fmtBtc(float x) => fmt(x) + " BTC"
+fmtUsd(float x) => (x < 0 ? "-$" : "$") + fmt(math.abs(x))
+
+isUsd = units == "USD"
+fmtU(float x) => isUsd ? fmtUsd(x) : fmtBtc(x)
+
+// ===== Calculations =====
+coins = volume * multiplier
+rng   = high - low
+
+float wBuy = method == "Binary" ? (close >= open ? 1.0 : 0.0) : (rng > 0 ? (close - low) / rng : 0.5)
+wBuy := math.max(0.0, math.min(1.0, wBuy))
+wSell = 1.0 - wBuy
+
+buyCoins  = coins * wBuy
+sellCoins = coins * wSell
+buyUsd    = buyCoins * close
+sellUsd   = sellCoins * close
+
+buyVal  = isUsd ? buyUsd  : buyCoins
+sellVal = isUsd ? sellUsd : sellCoins
+totVal  = buyVal + sellVal
+
+// ===== Columns (the "candle form") =====
+hline(0, "Zero", color=color.new(color.gray, 70))
+plot(buyVal,   title="Buyers",  style=plot.style_columns, color=buyColor)
+plot(-sellVal, title="Sellers", style=plot.style_columns, color=sellColor)
+plot(showMA ? ta.sma(totVal, maLen) : na, title="Total MA", color=color.blue, linewidth=2)
+
+// ===== Numbers on each bar =====
+sz = textSize == "Tiny" ? size.tiny : textSize == "Small" ? size.small : size.normal
+var array<label> lbls = array.new<label>()
+
+if showLabels and bar_index > last_bar_index - labelBars
+    lb = label.new(bar_index, buyVal,   fmtU(buyVal),  style=label.style_label_down, color=color.new(color.white, 100), textcolor=buyColor,  size=sz)
+    ls = label.new(bar_index, -sellVal, fmtU(sellVal), style=label.style_label_up,   color=color.new(color.white, 100), textcolor=sellColor, size=sz)
+    array.push(lbls, lb)
+    array.push(lbls, ls)
+    while array.size(lbls) > labelBars * 2
+        label.delete(array.shift(lbls))
+
+// ===== Summary table (current bar, both units) =====
+var table tb = table.new(position.top_right, 3, 5, bgcolor=color.new(color.black, 30), border_width=1)
+if barstate.islast
+    deltaC   = buyCoins - sellCoins
+    deltaU   = buyUsd - sellUsd
+    deltaCol = deltaC >= 0 ? buyColor : sellColor
+    table.cell(tb, 0, 0, "This bar", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 0, "BTC",      text_color=color.white, text_size=size.small)
+    table.cell(tb, 2, 0, "USD",      text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 1, "Buy",      text_color=buyColor,  text_size=size.small)
+    table.cell(tb, 1, 1, fmtBtc(buyCoins),  text_color=buyColor,  text_size=size.small)
+    table.cell(tb, 2, 1, fmtUsd(buyUsd),    text_color=buyColor,  text_size=size.small)
+    table.cell(tb, 0, 2, "Sell",     text_color=sellColor, text_size=size.small)
+    table.cell(tb, 1, 2, fmtBtc(sellCoins), text_color=sellColor, text_size=size.small)
+    table.cell(tb, 2, 2, fmtUsd(sellUsd),   text_color=sellColor, text_size=size.small)
+    table.cell(tb, 0, 3, "Delta",    text_color=deltaCol,  text_size=size.small)
+    table.cell(tb, 1, 3, fmtBtc(deltaC),    text_color=deltaCol,  text_size=size.small)
+    table.cell(tb, 2, 3, fmtUsd(deltaU),    text_color=deltaCol,  text_size=size.small)
+    table.cell(tb, 0, 4, "Buy / Sell %", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 4, str.tostring(wBuy * 100, "0") + "%",  text_color=buyColor,  text_size=size.small)
+    table.cell(tb, 2, 4, str.tostring(wSell * 100, "0") + "%", text_color=sellColor, text_size=size.small)
