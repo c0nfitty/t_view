@@ -1,0 +1,207 @@
+//@version=7
+//=============================================================================
+// Money Volume • Buyers vs Sellers  v2
+// Based on the original by @tgambinox
+//
+// What's new in v2:
+//  • Intrabar split: each candle is broken into 1-minute bars (auto-picked)
+//    and each one is classified buy/sell. Much better than guessing from
+//    where the candle closed. Falls back to the estimate when no data.
+//  • Combine exchanges: sums Coinbase, Kraken, Bitstamp and Gemini so the
+//    numbers aren't tied to one exchange.
+//  • Running delta: buys minus sells since the current contract window
+//    started (15 min / 1 hour / 1 day). Resets at each window.
+//  • Volume spikes: bars with unusually high volume get highlighted.
+//=============================================================================
+indicator("Money Volume • Buyers vs Sellers v2", shorttitle="MoneyVol v2", overlay=false, max_labels_count=500)
+
+// ===== Inputs =====
+grpData = "Data"
+method    = input.string("Intrabar (best)", "Split method", options=["Intrabar (best)", "Close position (estimate)", "Up/Down candle"], group=grpData, tooltip="Intrabar: splits each candle into smaller bars and classifies each one. Close position: guesses from where the candle closed in its range. Up/Down: whole candle is buy if green, sell if red.")
+ltfChoice = input.string("Auto", "Intrabar resolution", options=["Auto", "1", "5", "15", "60"], group=grpData, tooltip="Minutes per sub-bar. Auto picks a sensible one for your chart timeframe.")
+combine   = input.bool(true, "Combine major exchanges", group=grpData, tooltip="Adds Coinbase, Kraken, Bitstamp and Gemini BTC/USD together. Turn off to use only the chart's symbol.")
+units     = input.string("BTC", "Display units", options=["BTC", "USD"], group=grpData)
+
+grpWin = "Contract window"
+view      = input.string("Buy/Sell bars", "View", options=["Buy/Sell bars", "Running delta"], group=grpWin, tooltip="Add the indicator twice to see both at once.")
+windowLen = input.string("1 Hour", "Window length", options=["15 Min", "1 Hour", "1 Day"], group=grpWin, tooltip="Match this to the Kalshi contract you're looking at.")
+dayHourET = input.int(17, "Daily reset hour (Eastern)", minval=0, maxval=23, group=grpWin, tooltip="Only used for the 1 Day window. Set it to the contract's close time in ET.")
+
+grpLook = "Display"
+showLabels = input.bool(true, "Show numbers on bars", group=grpLook)
+labelBars  = input.int(15, "Number of recent bars with numbers", minval=1, maxval=200, group=grpLook)
+textSize   = input.string("Small", "Number size", options=["Tiny", "Small", "Normal"], group=grpLook)
+showMA     = input.bool(true, "Show moving average", group=grpLook)
+maLen      = input.int(20, "Average length", minval=1, group=grpLook)
+showSpikes = input.bool(true, "Highlight volume spikes", group=grpLook)
+spikeMult  = input.float(2.0, "Spike = volume above (× average)", minval=1.0, step=0.25, group=grpLook)
+buyColor   = input.color(color.teal, "Buyers color", group=grpLook)
+sellColor  = input.color(color.orange, "Sellers color", group=grpLook)
+
+// ===== Formatting helpers =====
+fmt(float x) =>
+    a = math.abs(x)
+    a >= 1e9 ? str.tostring(x / 1e9, "0.##") + "B" :
+     a >= 1e6 ? str.tostring(x / 1e6, "0.##") + "M" :
+     a >= 1e3 ? str.tostring(x / 1e3, "0.##") + "K" :
+     str.tostring(x, "0.##")
+
+fmtBtc(float x) => fmt(x) + " BTC"
+fmtUsd(float x) => (x < 0 ? "-$" : "$") + fmt(math.abs(x))
+
+isUsd = units == "USD"
+fmtU(float x) => isUsd ? fmtUsd(x) : fmtBtc(x)
+
+// ===== Intrabar timeframe =====
+tfSec  = timeframe.in_seconds()
+ltf    = ltfChoice != "Auto" ? ltfChoice : tfSec <= 3600 ? "1" : tfSec <= 14400 ? "5" : tfSec <= 86400 ? "15" : "60"
+useLtf = method == "Intrabar (best)" and tfSec > 60
+
+// ===== Buy/sell split for one symbol =====
+// Returns [buyCoins, sellCoins, buyUsd, sellUsd, usedIntrabar]
+flow(simple string sym) =>
+    [ao, ac, av] = request.security_lower_tf(sym, ltf, [open, close, volume], ignore_invalid_symbol=true, ignore_invalid_timeframe=true)
+    [o, h, l, c, v] = request.security(sym, timeframe.period, [open, high, low, close, volume], ignore_invalid_symbol=true)
+    float bC = 0.0
+    float sC = 0.0
+    float bU = 0.0
+    float sU = 0.0
+    bool intra = false
+    n = array.size(av)
+    if useLtf and n > 0
+        intra := true
+        for i = 0 to n - 1
+            vi = nz(array.get(av, i))
+            ci = array.get(ac, i)
+            oi = array.get(ao, i)
+            if not na(ci) and not na(oi)
+                wb = ci > oi ? 1.0 : ci < oi ? 0.0 : 0.5
+                bC += vi * wb
+                sC += vi * (1.0 - wb)
+                bU += vi * wb * ci
+                sU += vi * (1.0 - wb) * ci
+    else if not na(v) and not na(c)
+        rng = h - l
+        float wb = method == "Up/Down candle" ? (c >= o ? 1.0 : 0.0) : (rng > 0 ? (c - l) / rng : 0.5)
+        wb := math.max(0.0, math.min(1.0, wb))
+        bC := v * wb
+        sC := v * (1.0 - wb)
+        bU := bC * c
+        sU := sC * c
+    [bC, sC, bU, sU, intra]
+
+[b0, s0, bu0, su0, i0] = flow(syminfo.tickerid)
+[b1, s1, bu1, su1, i1] = flow("COINBASE:BTCUSD")
+[b2, s2, bu2, su2, i2] = flow("KRAKEN:XBTUSD")
+[b3, s3, bu3, su3, i3] = flow("BITSTAMP:BTCUSD")
+[b4, s4, bu4, su4, i4] = flow("GEMINI:BTCUSD")
+
+buyCoins  = combine ? b1 + b2 + b3 + b4     : b0
+sellCoins = combine ? s1 + s2 + s3 + s4     : s0
+buyUsd    = combine ? bu1 + bu2 + bu3 + bu4 : bu0
+sellUsd   = combine ? su1 + su2 + su3 + su4 : su0
+intraUsed = combine ? (i1 or i2 or i3 or i4) : i0
+
+buyVal  = isUsd ? buyUsd  : buyCoins
+sellVal = isUsd ? sellUsd : sellCoins
+totVal  = buyVal + sellVal
+
+// ===== Running delta for the contract window =====
+etHour   = hour(time, "America/New_York")
+new15    = timeframe.change("15")
+new60    = timeframe.change("60")
+newDay   = etHour == dayHourET and etHour[1] != dayHourET
+newWindow = windowLen == "15 Min" ? new15 : windowLen == "1 Hour" ? new60 : newDay
+
+var float winBuyC  = 0.0
+var float winSellC = 0.0
+var float winBuyU  = 0.0
+var float winSellU = 0.0
+if newWindow
+    winBuyC  := 0.0
+    winSellC := 0.0
+    winBuyU  := 0.0
+    winSellU := 0.0
+winBuyC  += buyCoins
+winSellC += sellCoins
+winBuyU  += buyUsd
+winSellU += sellUsd
+
+winDeltaC = winBuyC - winSellC
+winDeltaU = winBuyU - winSellU
+winDelta  = isUsd ? winDeltaU : winDeltaC
+
+// ===== Volume spikes =====
+avgTot  = ta.sma(totVal, maLen)
+spikeX  = avgTot > 0 ? totVal / avgTot : 0.0
+isSpike = spikeX >= spikeMult
+
+// ===== Plots =====
+barsView = view == "Buy/Sell bars"
+
+hline(0, "Zero", color=color.new(color.gray, 70))
+plot(barsView ? buyVal   : na, title="Buyers",  style=plot.style_columns, color=buyColor)
+plot(barsView ? -sellVal : na, title="Sellers", style=plot.style_columns, color=sellColor)
+plot(barsView and showMA ? avgTot : na, title="Average volume", color=color.blue, linewidth=2)
+
+plot(barsView ? na : winDelta, title="Running delta", style=plot.style_columns, color=winDelta >= 0 ? buyColor : sellColor)
+
+bgcolor(showSpikes and isSpike ? color.new(color.yellow, 82) : na, title="Volume spike")
+bgcolor(newWindow ? color.new(color.gray, 85) : na, title="New window")
+
+// ===== Numbers on each bar =====
+sz = textSize == "Tiny" ? size.tiny : textSize == "Small" ? size.small : size.normal
+var array<label> lbls = array.new<label>()
+
+if barsView and showLabels and bar_index > last_bar_index - labelBars
+    lb = label.new(bar_index, buyVal,   fmtU(buyVal),  style=label.style_label_down, color=color.new(color.white, 100), textcolor=buyColor,  size=sz)
+    ls = label.new(bar_index, -sellVal, fmtU(sellVal), style=label.style_label_up,   color=color.new(color.white, 100), textcolor=sellColor, size=sz)
+    array.push(lbls, lb)
+    array.push(lbls, ls)
+    while array.size(lbls) > labelBars * 2
+        label.delete(array.shift(lbls))
+
+// ===== Summary table =====
+var table tb = table.new(position.top_right, 3, 8, bgcolor=color.new(color.black, 30), border_width=1)
+cell(int col, int row, string txt, color c) =>
+    table.cell(tb, col, row, txt, text_color=c, text_size=size.small)
+
+if barstate.islast
+    dC   = buyCoins - sellCoins
+    dU   = buyUsd - sellUsd
+    dCol = dC >= 0 ? buyColor : sellColor
+    wCol = winDeltaC >= 0 ? buyColor : sellColor
+    winTot = winBuyC + winSellC
+    winBuyPct = winTot > 0 ? winBuyC / winTot * 100 : 50.0
+
+    cell(0, 0, "This bar", color.white)
+    cell(1, 0, "BTC", color.white)
+    cell(2, 0, "USD", color.white)
+
+    cell(0, 1, "Buy", buyColor)
+    cell(1, 1, fmtBtc(buyCoins), buyColor)
+    cell(2, 1, fmtUsd(buyUsd), buyColor)
+
+    cell(0, 2, "Sell", sellColor)
+    cell(1, 2, fmtBtc(sellCoins), sellColor)
+    cell(2, 2, fmtUsd(sellUsd), sellColor)
+
+    cell(0, 3, "Delta", dCol)
+    cell(1, 3, fmtBtc(dC), dCol)
+    cell(2, 3, fmtUsd(dU), dCol)
+
+    cell(0, 4, "Window delta (" + windowLen + ")", wCol)
+    cell(1, 4, fmtBtc(winDeltaC), wCol)
+    cell(2, 4, fmtUsd(winDeltaU), wCol)
+
+    cell(0, 5, "Window buy / sell", color.white)
+    cell(1, 5, str.tostring(winBuyPct, "0") + "%", buyColor)
+    cell(2, 5, str.tostring(100 - winBuyPct, "0") + "%", sellColor)
+
+    cell(0, 6, "Volume vs average", color.white)
+    cell(1, 6, str.tostring(spikeX, "0.0") + "×", isSpike ? color.yellow : color.white)
+    cell(2, 6, isSpike ? "SPIKE" : "", color.yellow)
+
+    cell(0, 7, "Source", color.gray)
+    cell(1, 7, intraUsed ? "Intrabar (" + ltf + "m)" : "Estimate", color.gray)
+    cell(2, 7, combine ? "4 exchanges" : syminfo.ticker, color.gray)
